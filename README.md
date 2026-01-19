@@ -46,3 +46,5 @@ Crie o arquivo no servidor:
 
 ```bash
 nano controlpanel.sh
+
+Direitos de cópia colocando os dados autor nos créditos.
