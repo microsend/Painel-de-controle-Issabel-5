@@ -2,8 +2,18 @@
 set -euo pipefail
 
 # ==========================================================
-# Issabel 5 - Control Panel (control_panel) Installer FIXED
+# Issabel 5 - Control Panel (control_panel) Installer 
 # Copyright David Oliveira  WhatsApp +55(16) 98170-3272
+# ==========================================================
+# ==========================================================
+# Issabel 5 - Control Panel Installer
+# Modo suportado:
+#   classic  = PBX -> Issabel Panel
+#   topmenu  = menu próprio "Control Panel" no topo
+# Uso:
+#   bash install_control_panel.sh
+#   bash install_control_panel.sh classic
+#   bash install_control_panel.sh topmenu
 # ==========================================================
 
 MODULES_DIR="/var/www/html/modules"
@@ -18,31 +28,45 @@ MENU_DB="/var/www/db/menu.db"
 ASTERISK_USER="asterisk"
 ASTERISK_GROUP="asterisk"
 
-# Grupo Administrator no seu ambiente
+# Ajuste se necessário no seu ambiente
 ADMIN_GROUP_ID="1"
 
-log()  { echo -e "\033[1;32m[OK]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
+# classic | topmenu
+MENU_MODE="${1:-classic}"
+
+log()  { echo -e "\033[1;32m[OK]\033[0m $*" >&2; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 err()  { echo -e "\033[1;31m[ERRO]\033[0m $*" >&2; }
 
 need_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
-    err "Execute como root: sudo bash $0"
+    err "Execute como root: sudo bash $0 [classic|topmenu]"
     exit 1
   fi
+}
+
+check_mode() {
+  case "$MENU_MODE" in
+    classic|topmenu) ;;
+    *)
+      err "Modo inválido: $MENU_MODE"
+      err "Use: classic ou topmenu"
+      exit 1
+      ;;
+  esac
 }
 
 install_deps() {
   log "Instalando dependências (git, sqlite)..."
   if command -v dnf >/dev/null 2>&1; then
-    dnf -y install git sqlite || true
+    dnf -y install git sqlite
   else
-    yum -y install git sqlite || true
+    yum -y install git sqlite
   fi
 }
 
 validate_env() {
-  log "Validando estrutura do Issabel 5..."
+  log "Validando estrutura do Issabel..."
   [[ -d "$MODULES_DIR" ]] || { err "Não achei $MODULES_DIR"; exit 1; }
   [[ -f "$ACL_DB" ]]      || { err "Não achei $ACL_DB"; exit 1; }
   [[ -f "$MENU_DB" ]]     || { err "Não achei $MENU_DB"; exit 1; }
@@ -53,8 +77,9 @@ clone_repo() {
   mkdir -p /usr/src
 
   if [[ -d "$REPO_DIR/.git" ]]; then
-    cd "$REPO_DIR"
-    git pull
+    git -C "$REPO_DIR" pull --ff-only || {
+      warn "git pull falhou. Mantendo conteúdo atual em $REPO_DIR"
+    }
   else
     git clone "$REPO_URL" "$REPO_DIR"
   fi
@@ -63,12 +88,11 @@ clone_repo() {
 install_module_files() {
   log "Instalando arquivos do módulo $MODULE_NAME..."
 
-  if [[ ! -d "$REPO_DIR/$MODULE_NAME" ]]; then
-    err "Pasta do módulo não encontrada: $REPO_DIR/$MODULE_NAME"
+  [[ -d "$REPO_DIR/$MODULE_NAME" ]] || {
+    err "Pasta não encontrada: $REPO_DIR/$MODULE_NAME"
     exit 1
-  fi
+  }
 
-  # Backup se já existir
   if [[ -d "$MODULES_DIR/$MODULE_NAME" ]]; then
     BACKUP_DIR="${MODULES_DIR}/${MODULE_NAME}_backup_$(date +%Y%m%d_%H%M%S)"
     warn "Módulo já existe. Criando backup em: $BACKUP_DIR"
@@ -81,21 +105,29 @@ install_module_files() {
   find "$MODULES_DIR/$MODULE_NAME" -type d -exec chmod 755 {} \;
   find "$MODULES_DIR/$MODULE_NAME" -type f -exec chmod 644 {} \;
 
-  [[ -f "$MODULES_DIR/$MODULE_NAME/index.php" ]] || warn "index.php não encontrado (estranho)."
+  if [[ ! -f "$MODULES_DIR/$MODULE_NAME/index.php" ]]; then
+    warn "index.php não encontrado em $MODULES_DIR/$MODULE_NAME"
+  fi
+
   log "Arquivos instalados em $MODULES_DIR/$MODULE_NAME"
 }
 
-ensure_acl_resource() {
-  log "Registrando resource em acl_resource..."
+get_resource_id() {
+  sqlite3 "$ACL_DB" "SELECT id FROM acl_resource WHERE name='$MODULE_NAME' LIMIT 1;"
+}
 
+ensure_acl_resource() {
+  log "Garantindo resource em acl_resource..."
   local RID
-  RID="$(sqlite3 "$ACL_DB" "SELECT id FROM acl_resource WHERE name='$MODULE_NAME' LIMIT 1;")"
+  RID="$(get_resource_id)"
 
   if [[ -n "$RID" ]]; then
     log "acl_resource já existe: id=$RID"
   else
-    sqlite3 "$ACL_DB" "INSERT INTO acl_resource (name, description) VALUES ('$MODULE_NAME', 'Control Panel');"
-    RID="$(sqlite3 "$ACL_DB" "SELECT id FROM acl_resource WHERE name='$MODULE_NAME' LIMIT 1;")"
+    sqlite3 "$ACL_DB" \
+      "INSERT INTO acl_resource (name, description) VALUES ('$MODULE_NAME', 'Control Panel');"
+    RID="$(get_resource_id)"
+    [[ -n "$RID" ]] || { err "Falha ao criar acl_resource"; exit 1; }
     log "acl_resource criado: id=$RID"
   fi
 
@@ -104,119 +136,189 @@ ensure_acl_resource() {
 
 ensure_module_privileges() {
   local RID="$1"
-  log "Criando privilégios do módulo em acl_module_privileges (access/view)..."
+  log "Garantindo privilégios do módulo..."
 
-  # access
-  sqlite3 "$ACL_DB" "INSERT OR IGNORE INTO acl_module_privileges (id_resource, privilege, desc_privilege)
-                     VALUES ($RID, 'access', 'Access Control Panel');"
+  sqlite3 "$ACL_DB" \
+    "INSERT OR IGNORE INTO acl_module_privileges (id_resource, privilege, desc_privilege)
+     VALUES ($RID, 'access', 'Access Control Panel');"
 
-  # view
-  sqlite3 "$ACL_DB" "INSERT OR IGNORE INTO acl_module_privileges (id_resource, privilege, desc_privilege)
-                     VALUES ($RID, 'view', 'View Control Panel');"
+  sqlite3 "$ACL_DB" \
+    "INSERT OR IGNORE INTO acl_module_privileges (id_resource, privilege, desc_privilege)
+     VALUES ($RID, 'view', 'View Control Panel');"
 
-  log "Privilégios criados (ou já existiam)."
+  log "Privilégios access/view OK"
 }
 
 ensure_group_permissions_for_privileges() {
   local RID="$1"
+  local PID_ACCESS PID_VIEW
 
   log "Vinculando privilégios ao grupo administrator (id=$ADMIN_GROUP_ID)..."
 
-  # pegar ids dos privileges
-  local PID_ACCESS PID_VIEW
-  PID_ACCESS="$(sqlite3 "$ACL_DB" "SELECT id FROM acl_module_privileges WHERE id_resource=$RID AND privilege='access' LIMIT 1;")"
-  PID_VIEW="$(sqlite3 "$ACL_DB" "SELECT id FROM acl_module_privileges WHERE id_resource=$RID AND privilege='view' LIMIT 1;")"
+  PID_ACCESS="$(sqlite3 "$ACL_DB" \
+    "SELECT id FROM acl_module_privileges WHERE id_resource=$RID AND privilege='access' LIMIT 1;")"
+  PID_VIEW="$(sqlite3 "$ACL_DB" \
+    "SELECT id FROM acl_module_privileges WHERE id_resource=$RID AND privilege='view' LIMIT 1;")"
 
-  if [[ -z "$PID_ACCESS" || -z "$PID_VIEW" ]]; then
-    err "Não consegui localizar privilege IDs (access/view)."
-    exit 1
-  fi
+  [[ -n "$PID_ACCESS" ]] || { err "Privilege access não localizado"; exit 1; }
+  [[ -n "$PID_VIEW"   ]] || { err "Privilege view não localizado"; exit 1; }
 
-  sqlite3 "$ACL_DB" "INSERT OR IGNORE INTO acl_module_group_permissions (id_group, id_module_privilege)
-                     VALUES ($ADMIN_GROUP_ID, $PID_ACCESS);"
+  sqlite3 "$ACL_DB" \
+    "INSERT OR IGNORE INTO acl_module_group_permissions (id_group, id_module_privilege)
+     VALUES ($ADMIN_GROUP_ID, $PID_ACCESS);"
 
-  sqlite3 "$ACL_DB" "INSERT OR IGNORE INTO acl_module_group_permissions (id_group, id_module_privilege)
-                     VALUES ($ADMIN_GROUP_ID, $PID_VIEW);"
+  sqlite3 "$ACL_DB" \
+    "INSERT OR IGNORE INTO acl_module_group_permissions (id_group, id_module_privilege)
+     VALUES ($ADMIN_GROUP_ID, $PID_VIEW);"
 
-  log "Grupo administrator liberado para access/view."
+  log "Grupo liberado para access/view"
 }
 
 ensure_group_action_access() {
   local RID="$1"
-  log "Garantindo acl_group_permission (action access) para administrator..."
+  log "Garantindo action access para o grupo..."
 
-  # action access no seu ambiente é 1
-  sqlite3 "$ACL_DB" "INSERT OR IGNORE INTO acl_group_permission (id_action, id_group, id_resource)
-                     VALUES (1, $ADMIN_GROUP_ID, $RID);"
+  if sqlite3 "$ACL_DB" ".tables" | grep -qw "acl_action"; then
+    local ACTION_ID=""
+    ACTION_ID="$(sqlite3 "$ACL_DB" \
+      "SELECT id FROM acl_action WHERE name='access' LIMIT 1;" 2>/dev/null || true)"
 
-  log "acl_group_permission OK."
+    if [[ -z "$ACTION_ID" ]]; then
+      ACTION_ID="1"
+      warn "acl_action 'access' não localizado. Usando id_action=1"
+    fi
+
+    sqlite3 "$ACL_DB" \
+      "INSERT OR IGNORE INTO acl_group_permission (id_action, id_group, id_resource)
+       VALUES ($ACTION_ID, $ADMIN_GROUP_ID, $RID);"
+
+    log "acl_group_permission OK"
+  else
+    warn "Tabela acl_action não localizada. Ignorando acl_group_permission"
+  fi
 }
 
-ensure_menu_entry() {
-  log "Registrando menu no menu.db (pbxconfig -> Issabel Panel)..."
+ensure_classic_menu() {
+  log "Garantindo menu clássico em PBX -> Issabel Panel..."
 
   local EXISTS
   EXISTS="$(sqlite3 "$MENU_DB" "SELECT COUNT(*) FROM menu WHERE id='$MODULE_NAME';")"
 
   if [[ "$EXISTS" -gt 0 ]]; then
-    warn "Menu id '$MODULE_NAME' já existe. Mantendo."
+    warn "Menu '$MODULE_NAME' já existe. Mantendo."
   else
-    sqlite3 "$MENU_DB" "INSERT INTO menu (id, IdParent, Link, Name, Type, order_no)
-                        VALUES ('$MODULE_NAME', 'pbxconfig', '', 'Issabel Panel', 'module', 8);"
-    log "Menu criado em pbxconfig."
+    sqlite3 "$MENU_DB" \
+      "INSERT INTO menu (id, IdParent, Link, Name, Type, order_no)
+       VALUES ('$MODULE_NAME', 'pbxconfig', '', 'Issabel Panel', 'module', 8);"
+    log "Menu clássico criado"
   fi
+}
+
+ensure_topmenu() {
+  log "Garantindo menu top 'Control Panel'..."
+
+  sqlite3 "$MENU_DB" \
+    "UPDATE menu SET order_no=1 WHERE id='system';" || true
+
+  local ROOT_EXISTS CHILD_EXISTS
+  ROOT_EXISTS="$(sqlite3 "$MENU_DB" "SELECT COUNT(*) FROM menu WHERE id='menu_control_panel';")"
+  CHILD_EXISTS="$(sqlite3 "$MENU_DB" "SELECT COUNT(*) FROM menu WHERE id='$MODULE_NAME';")"
+
+  if [[ "$ROOT_EXISTS" -eq 0 ]]; then
+    sqlite3 "$MENU_DB" \
+      "INSERT INTO menu (id, IdParent, Link, Name, Type, order_no)
+       VALUES ('menu_control_panel', '', '', 'Control Panel', '', 0);"
+    log "Menu raiz menu_control_panel criado"
+  else
+    warn "Menu raiz menu_control_panel já existe"
+  fi
+
+  if [[ "$CHILD_EXISTS" -eq 0 ]]; then
+    sqlite3 "$MENU_DB" \
+      "INSERT INTO menu (id, IdParent, Link, Name, Type, order_no)
+       VALUES ('$MODULE_NAME', 'menu_control_panel', '', 'Control Panel', 'module', 1);"
+    log "Entrada control_panel criada em menu_control_panel"
+  else
+    warn "Entrada control_panel já existe"
+  fi
+}
+
+ensure_menu() {
+  case "$MENU_MODE" in
+    classic) ensure_classic_menu ;;
+    topmenu) ensure_topmenu ;;
+  esac
 }
 
 restart_services() {
   log "Reiniciando Apache..."
   systemctl restart httpd
-  log "Apache reiniciado."
+  log "Apache reiniciado"
 }
 
 final_checks() {
-  log "Checks finais..."
-
   local RID
-  RID="$(sqlite3 "$ACL_DB" "SELECT id FROM acl_resource WHERE name='$MODULE_NAME' LIMIT 1;")"
+  RID="$(get_resource_id)"
 
   echo
   echo "==== ACL RESOURCE ===="
-  sqlite3 "$ACL_DB" "SELECT id,name,description FROM acl_resource WHERE id=$RID;"
+  sqlite3 "$ACL_DB" \
+    "SELECT id,name,description FROM acl_resource WHERE name='$MODULE_NAME';"
 
   echo
   echo "==== MODULE PRIVILEGES ===="
-  sqlite3 "$ACL_DB" "SELECT id,id_resource,privilege,desc_privilege FROM acl_module_privileges WHERE id_resource=$RID;"
+  sqlite3 "$ACL_DB" \
+    "SELECT id,id_resource,privilege,desc_privilege
+     FROM acl_module_privileges
+     WHERE id_resource=$RID;"
 
   echo
-  echo "==== GROUP PERMISSIONS (administrator) ===="
-  sqlite3 "$ACL_DB" "SELECT * FROM acl_module_group_permissions WHERE id_group=$ADMIN_GROUP_ID AND id_module_privilege IN
-                      (SELECT id FROM acl_module_privileges WHERE id_resource=$RID);"
+  echo "==== GROUP PERMISSIONS ===="
+  sqlite3 "$ACL_DB" \
+    "SELECT *
+     FROM acl_module_group_permissions
+     WHERE id_group=$ADMIN_GROUP_ID
+       AND id_module_privilege IN
+       (SELECT id FROM acl_module_privileges WHERE id_resource=$RID);"
 
   echo
   echo "==== MENU ENTRY ===="
-  sqlite3 "$MENU_DB" "SELECT id,IdParent,Name,Type,order_no FROM menu WHERE id='$MODULE_NAME';"
+  sqlite3 "$MENU_DB" \
+    "SELECT id,IdParent,Name,Type,order_no
+     FROM menu
+     WHERE id IN ('menu_control_panel','$MODULE_NAME');"
 
   echo
-  log "Finalizado ✅"
+  log "Finalizado"
   echo
-  echo "Acesse:"
-  echo "  Issabel GUI -> PBX -> Issabel Panel"
-  echo "Ou direto:"
-  echo "  index.php?menu=control_panel"
+  echo "Acesso esperado:"
+  if [[ "$MENU_MODE" == "classic" ]]; then
+    echo "  Issabel GUI -> PBX -> Issabel Panel"
+  else
+    echo "  Menu superior -> Control Panel"
+  fi
+  echo "  URL direta: index.php?menu=control_panel"
   echo
 }
 
-# ===================== MAIN =====================
-need_root
-install_deps
-validate_env
-clone_repo
-install_module_files
+main() {
+  need_root
+  check_mode
+  install_deps
+  validate_env
+  clone_repo
+  install_module_files
 
-RID="$(ensure_acl_resource)"
-ensure_module_privileges "$RID"
-ensure_group_permissions_for_privileges "$RID"
-ensure_group_action_access "$RID"
-ensure_menu_entry
-restart_services
-final_checks
+  local RID
+  RID="$(ensure_acl_resource)"
+  ensure_module_privileges "$RID"
+  ensure_group_permissions_for_privileges "$RID"
+  ensure_group_action_access "$RID"
+  ensure_menu
+  restart_services
+  final_checks
+}
+
+main "$@"
+ 
+
